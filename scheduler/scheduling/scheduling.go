@@ -423,6 +423,80 @@ func (s *scheduling) FindCandidateParents(ctx context.Context, peer *standard.Pe
 		}
 	}
 
+	// If the number of candidates exceeds the limit, try to remove parents with high outDegree
+	outDegreeLimit := candidateParentLimit + 1
+	if len(candidateParents) > candidateParentLimit {
+		filtered := make([]*standard.Peer, 0, len(candidateParents))
+		removed := 0
+
+		for i := len(candidateParents) - 1; i >= 0; i-- {
+			parent := candidateParents[i]
+
+			// If the removed count is less than the limit, keep the parent
+			if len(candidateParents)-removed <= candidateParentLimit {
+				filtered = append(filtered, parent)
+				continue
+			}
+
+			outDegree, err := parent.Task.PeerOutDegree(parent.ID)
+			// If out degree is not found, remove the parent
+			if err != nil {
+				peer.Log.Debugf("can not find parent %s host %s vertex out dag", parent.ID, parent.Host.ID)
+				removed++
+				continue
+			}
+			// If out degree is greater than the limit, remove the parent
+			if outDegree >= outDegreeLimit {
+				peer.Log.Debugf("parent %s host %s is not selected, because its out degree is %d and current candidate Length is %d",
+					parent.ID, parent.Host.ID, outDegree, len(candidateParents)-removed)
+				removed++
+				continue
+			}
+			// Keep the parent
+			filtered = append(filtered, parent)
+		}
+
+		// Reverse back to original order
+		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+			filtered[i], filtered[j] = filtered[j], filtered[i]
+		}
+		candidateParents = filtered
+	}
+
+	// If the number of candidates exceeds the limit, try to remove parents which need back to source (Seed Peer)
+	minCandidateParentLimit := 2
+	if len(candidateParents) > minCandidateParentLimit {
+		filtered := make([]*standard.Peer, 0, len(candidateParents))
+		removed := 0
+
+		// From the end to the beginning, remove parents until the minimum limit is reached
+		for i := len(candidateParents) - 1; i >= 0; i-- {
+			p := candidateParents[i]
+
+			// If the removed count is less than the minimum limit, keep the parent
+			if len(candidateParents)-removed <= minCandidateParentLimit {
+				filtered = append(filtered, p)
+				continue
+			}
+			// If the parent needs back to source, remove the parent
+			if p.NeedBackToSource.Load() {
+				peer.Log.Debugf("parent %s host %s is not selected, because it needs back to source and current candidate Length is %d",
+					p.ID, p.Host.ID, len(candidateParents)-removed)
+				removed++
+				continue
+			}
+			// Keep the parent
+			filtered = append(filtered, p)
+		}
+
+		// Reverse back to original order
+		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+			filtered[i], filtered[j] = filtered[j], filtered[i]
+		}
+
+		candidateParents = filtered
+	}
+
 	// Trim the list to the configured limit if necessary
 	if len(candidateParents) > candidateParentLimit {
 		candidateParents = candidateParents[:candidateParentLimit]
