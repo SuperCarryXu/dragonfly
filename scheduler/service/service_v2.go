@@ -272,6 +272,12 @@ func (v *V2) AnnouncePeer(stream schedulerv2.Scheduler_AnnouncePeerServer) error
 			if err := v.handleDownloadPieceBackToSourceFailedRequest(ctx, req.GetPeerId(), downloadPieceBackToSourceFailedRequest); err != nil {
 				log.Error(err)
 			}
+		case *schedulerv2.AnnouncePeerRequest_GetChildPeerRequest:
+			getChildPeerRequest := announcePeerRequest.GetChildPeerRequest
+			log.Infof("receive GetChildPeerRequest, description: %s", getChildPeerRequest.GetDescription())
+			if err := v.handleGetChildPeerRequest(stream, req.GetPeerId()); err != nil {
+				log.Error(err)
+			}
 		default:
 			msg := fmt.Sprintf("receive unknow request: %#v", announcePeerRequest)
 			log.Error(msg)
@@ -1497,6 +1503,101 @@ func (v *V2) handleReschedulePeerRequest(_ context.Context, peerID string, candi
 
 	// Collect SchedulingDuration metrics.
 	metrics.ScheduleDuration.Observe(float64(time.Since(start).Milliseconds()))
+	return nil
+}
+
+// handleGetChildPeerRequest handles GetChildPeerRequest of AnnouncePeerRequest.
+func (v *V2) handleGetChildPeerRequest(stream schedulerv2.Scheduler_AnnouncePeerServer, peerID string) error {
+	peer, loaded := v.resource.PeerManager().Load(peerID)
+	if !loaded {
+		return status.Errorf(codes.NotFound, "peer %s not found", peerID)
+	}
+
+	// Get the vertex of the peer in the DAG.
+	vertex, err := peer.Task.DAG.GetVertex(peerID)
+	if err != nil {
+		logger.Warnf("peer %s not found in DAG: %v", peerID, err)
+		// Return empty response if peer is not in DAG
+		return stream.Send(&schedulerv2.AnnouncePeerResponse{
+			Response: &schedulerv2.AnnouncePeerResponse_EmptyTaskResponse{
+				EmptyTaskResponse: &schedulerv2.EmptyTaskResponse{},
+			},
+		})
+	}
+
+	// Get children peers from the vertex
+	children := vertex.Children.Values()
+	if len(children) == 0 {
+		logger.Infof("peer %s has no child peers", peerID)
+		// Return empty response if peer has no children
+		return stream.Send(&schedulerv2.AnnouncePeerResponse{
+			Response: &schedulerv2.AnnouncePeerResponse_EmptyTaskResponse{
+				EmptyTaskResponse: &schedulerv2.EmptyTaskResponse{},
+			},
+		})
+	}
+
+	// Convert child peers to API format and send response
+	candidateParents := make([]*commonv2.Peer, 0, len(children))
+	for _, child := range children {
+		childPeer := child.Value
+		if childPeer == nil {
+			continue
+		}
+
+		// Build peer information in commonv2.Peer format
+		p := &commonv2.Peer{
+			Id:                   childPeer.ID,
+			Priority:             childPeer.Priority,
+			ConcurrentPieceCount: childPeer.ConcurrentPieceCount,
+			Cost:                 durationpb.New(childPeer.Cost.Load()),
+			State:                childPeer.FSM.Current(),
+			NeedBackToSource:     childPeer.NeedBackToSource.Load(),
+			CreatedAt:            timestamppb.New(childPeer.CreatedAt.Load()),
+			UpdatedAt:            timestamppb.New(childPeer.UpdatedAt.Load()),
+		}
+
+		// Set range if available
+		if childPeer.Range != nil {
+			p.Range = &commonv2.Range{
+				Start:  uint64(childPeer.Range.Start),
+				Length: uint64(childPeer.Range.Length),
+			}
+		}
+
+		// Set host information
+		if childPeer.Host != nil {
+			p.Host = &commonv2.Host{
+				Id:              childPeer.Host.ID,
+				Type:            uint32(childPeer.Host.Type),
+				Hostname:        childPeer.Host.Hostname,
+				Ip:              childPeer.Host.IP,
+				DownloadPort:    childPeer.Host.DownloadPort,
+				DisableShared:   childPeer.Host.DisableShared,
+				Os:              childPeer.Host.OS,
+				Platform:        childPeer.Host.Platform,
+				PlatformFamily:  childPeer.Host.PlatformFamily,
+				PlatformVersion: childPeer.Host.PlatformVersion,
+				KernelVersion:   childPeer.Host.KernelVersion,
+			}
+		}
+
+		candidateParents = append(candidateParents, p)
+	}
+
+	logger.Infof("peer %s has %d child peers", peerID, len(candidateParents))
+
+	// Send NormalTaskResponse with child peers as candidate parents
+	if err := stream.Send(&schedulerv2.AnnouncePeerResponse{
+		Response: &schedulerv2.AnnouncePeerResponse_NormalTaskResponse{
+			NormalTaskResponse: &schedulerv2.NormalTaskResponse{
+				CandidateParents: candidateParents,
+			},
+		},
+	}); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+
 	return nil
 }
 
